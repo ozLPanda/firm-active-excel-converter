@@ -10,6 +10,7 @@ python -m pip install pyinstaller
 if errorlevel 1 goto :error
 
 python -m PyInstaller --clean --onefile --windowed --name satu-converter ^
+  --additional-hooks-dir pyinstaller_hooks ^
   --add-data "group_aliases.json;." ^
   --add-data "satu_schema.json;." ^
   gui.py

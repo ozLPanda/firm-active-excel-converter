@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import replace
 from pathlib import Path
-from tkinter import BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Radiobutton, Scrollbar, StringVar, Tk, Toplevel, filedialog, messagebox
+from tkinter import BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Menu, Radiobutton, Scrollbar, StringVar, TclError, Tk, Toplevel, filedialog, messagebox
 
 from converter import (
     GroupConfig,
@@ -26,15 +26,149 @@ class ConverterApp:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("760x210")
-        self.root.minsize(680, 210)
+        self.root.geometry("760x325")
+        self.root.minsize(680, 325)
 
         self.source_path = StringVar()
         self.output_path = StringVar()
         self.status = StringVar(value="Выберите исходный прайс для конвертации.")
+        self.progress_text = StringVar(value="")
+        self.progress_value = 0.0
+        self.image_progress_text = StringVar(value="")
+        self.image_progress_value = 0.0
+        self.allow_multiple_images = BooleanVar(value=False)
         self.apply_without_code_to_all: bool | None = None
 
+        self._bind_global_entry_shortcuts()
         self._build_ui()
+        self._center_window(self.root)
+
+    def _bind_global_entry_shortcuts(self) -> None:
+        self.root.bind_class("Entry", "<Control-KeyPress>", self._handle_entry_control_key)
+        self.root.bind_class("Entry", "<Shift-Insert>", self._paste_into_entry)
+        self.root.bind_class("Entry", "<Button-3>", self._show_entry_context_menu)
+
+    def _center_window(self, window) -> None:
+        window.update_idletasks()
+        width = window.winfo_width()
+        height = window.winfo_height()
+        if width <= 1 or height <= 1:
+            geometry = window.geometry().split("+", 1)[0]
+            if "x" in geometry:
+                try:
+                    width_text, height_text = geometry.split("x", 1)
+                    width = int(width_text)
+                    height = int(height_text)
+                except ValueError:
+                    width = max(window.winfo_reqwidth(), 1)
+                    height = max(window.winfo_reqheight(), 1)
+            else:
+                width = max(window.winfo_reqwidth(), 1)
+                height = max(window.winfo_reqheight(), 1)
+        x = max(0, (window.winfo_screenwidth() - width) // 2)
+        y = max(0, (window.winfo_screenheight() - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _bind_entry_shortcuts(self, entry: Entry) -> None:
+        entry.bind("<Control-KeyPress>", self._handle_entry_control_key)
+        entry.bind("<Shift-Insert>", self._paste_into_entry)
+        entry.bind("<Button-3>", self._show_entry_context_menu)
+
+    def _handle_entry_control_key(self, event) -> str | None:
+        # Windows keycodes make shortcuts work even when the active keyboard layout is Russian.
+        keycode = int(getattr(event, "keycode", 0) or 0)
+        if keycode == 86:  # V
+            return self._paste_into_entry(event)
+        if keycode == 67:  # C
+            return self._copy_from_entry(event)
+        if keycode == 88:  # X
+            return self._cut_from_entry(event)
+        if keycode == 65:  # A
+            entry = event.widget
+            entry.select_range(0, "end")
+            entry.icursor("end")
+            return "break"
+        return None
+
+    def _paste_into_entry(self, event) -> str:
+        entry = event.widget
+        try:
+            text = self.root.clipboard_get()
+        except TclError:
+            return "break"
+        try:
+            if entry.selection_present():
+                entry.delete("sel.first", "sel.last")
+        except TclError:
+            pass
+        entry.insert("insert", text)
+        return "break"
+
+    def _copy_from_entry(self, event) -> str:
+        entry = event.widget
+        try:
+            text = entry.selection_get()
+        except TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        return "break"
+
+    def _cut_from_entry(self, event) -> str:
+        entry = event.widget
+        try:
+            text = entry.selection_get()
+        except TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        entry.delete("sel.first", "sel.last")
+        return "break"
+
+    def _show_entry_context_menu(self, event) -> str:
+        entry = event.widget
+        entry.focus_set()
+        menu = Menu(entry, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: self._cut_from_entry_widget(entry))
+        menu.add_command(label="Копировать", command=lambda: self._copy_from_entry_widget(entry))
+        menu.add_command(label="Вставить", command=lambda: self._paste_into_entry_widget(entry))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: self._select_all_entry_text(entry))
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _paste_into_entry_widget(self, entry: Entry) -> None:
+        try:
+            text = self.root.clipboard_get()
+        except TclError:
+            return
+        try:
+            if entry.selection_present():
+                entry.delete("sel.first", "sel.last")
+        except TclError:
+            pass
+        entry.insert("insert", text)
+
+    def _copy_from_entry_widget(self, entry: Entry) -> None:
+        try:
+            text = entry.selection_get()
+        except TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _cut_from_entry_widget(self, entry: Entry) -> None:
+        try:
+            text = entry.selection_get()
+        except TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        entry.delete("sel.first", "sel.last")
+
+    def _select_all_entry_text(self, entry: Entry) -> None:
+        entry.select_range(0, "end")
+        entry.icursor("end")
 
     def _build_ui(self) -> None:
         container = Frame(self.root, padx=16, pady=14)
@@ -49,10 +183,27 @@ class ConverterApp:
         Entry(container, textvariable=self.output_path).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
         Button(container, text="Куда сохранить...", command=self.pick_output).grid(row=1, column=2, pady=6)
 
-        self.convert_button = Button(container, text="Конвертировать", command=self.start_convert, height=2)
-        self.convert_button.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(16, 8))
+        Checkbutton(
+            container,
+            text="Разрешить несколько разных фото для одного артикула (_2, _3)",
+            variable=self.allow_multiple_images,
+            anchor="w",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 2))
 
-        Label(container, textvariable=self.status, anchor="w").grid(row=3, column=0, columnspan=3, sticky="ew")
+        self.convert_button = Button(container, text="Конвертировать", command=self.start_convert, height=2)
+        self.convert_button.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 8))
+
+        Label(container, textvariable=self.status, anchor="w").grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.progress_canvas = Canvas(container, height=14, highlightthickness=1, highlightbackground="#b8b8b8", bg="#f3f3f3")
+        self.progress_fill = self.progress_canvas.create_rectangle(0, 0, 0, 14, fill="#4a90e2", width=0)
+        self.progress_canvas.bind("<Configure>", lambda _event: self._draw_progress())
+        self.progress_canvas.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        Label(container, textvariable=self.progress_text, anchor="w").grid(row=6, column=0, columnspan=3, sticky="ew")
+        self.image_progress_canvas = Canvas(container, height=14, highlightthickness=1, highlightbackground="#b8b8b8", bg="#f3f3f3")
+        self.image_progress_fill = self.image_progress_canvas.create_rectangle(0, 0, 0, 14, fill="#2e9d57", width=0)
+        self.image_progress_canvas.bind("<Configure>", lambda _event: self._draw_image_progress())
+        self.image_progress_canvas.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        Label(container, textvariable=self.image_progress_text, anchor="w").grid(row=8, column=0, columnspan=3, sticky="ew")
 
     def pick_source(self) -> None:
         path = filedialog.askopenfilename(
@@ -120,11 +271,19 @@ class ConverterApp:
 
         self.apply_without_code_to_all = None
         self.convert_button.config(state="disabled")
+        self._reset_progress()
         self.status.set("Конвертация выполняется...")
-        thread = threading.Thread(target=self._convert_in_background, args=(source, output, edited_group_configs), daemon=True)
+        allow_multiple_images = self.allow_multiple_images.get()
+        thread = threading.Thread(target=self._convert_in_background, args=(source, output, edited_group_configs, allow_multiple_images), daemon=True)
         thread.start()
 
-    def _convert_in_background(self, source: Path, output: Path, group_configs: list[GroupConfig]) -> None:
+    def _convert_in_background(
+        self,
+        source: Path,
+        output: Path,
+        group_configs: list[GroupConfig],
+        allow_multiple_images: bool,
+    ) -> None:
         try:
             stats = convert(
                 source,
@@ -136,6 +295,9 @@ class ConverterApp:
                 default_group_cache_path(),
                 self.confirm_duplicate_product,
                 self.ask_edit_missing_prices,
+                self._on_progress,
+                self._on_image_progress,
+                allow_multiple_images_per_product=allow_multiple_images,
             )
         except Exception as exc:
             self.root.after(0, self._show_error, exc)
@@ -153,6 +315,56 @@ class ConverterApp:
             stats.exported_images_count,
             stats.images_output_dir,
         )
+
+    def _reset_progress(self) -> None:
+        self.progress_value = 0
+        self.image_progress_value = 0
+        self._draw_progress()
+        self._draw_image_progress()
+        self.progress_text.set("")
+        self.image_progress_text.set("")
+
+    def _set_progress(self, processed: int, total: int) -> None:
+        if total <= 0:
+            self.progress_value = 0
+            self._draw_progress()
+            self.progress_text.set("Товаров для обработки: 0")
+            return
+        self.progress_value = max(0, min(1, processed / total))
+        self._draw_progress()
+        self.progress_text.set(f"Обработано товаров: {processed} из {total}")
+
+    def _on_progress(self, processed: int, total: int) -> None:
+        self.root.after(0, self._set_progress, processed, total)
+
+    def _set_image_progress(self, processed: int, total: int) -> None:
+        if total < 0:
+            total_sheets = abs(total)
+            self.image_progress_value = 0 if total_sheets == 0 else max(0, min(1, processed / total_sheets))
+            self._draw_image_progress()
+            self.image_progress_text.set(f"Анализ листов с изображениями: {processed} из {total_sheets}")
+            return
+        if total <= 0:
+            self.image_progress_value = 0
+            self._draw_image_progress()
+            self.image_progress_text.set("Изображений для обработки: 0")
+            return
+        self.image_progress_value = max(0, min(1, processed / total))
+        self._draw_image_progress()
+        self.image_progress_text.set(f"Обработано изображений: {processed} из {total}")
+
+    def _on_image_progress(self, processed: int, total: int) -> None:
+        self.root.after(0, self._set_image_progress, processed, total)
+
+    def _draw_progress(self) -> None:
+        width = max(0, self.progress_canvas.winfo_width())
+        height = max(1, self.progress_canvas.winfo_height())
+        self.progress_canvas.coords(self.progress_fill, 0, 0, width * self.progress_value, height)
+
+    def _draw_image_progress(self) -> None:
+        width = max(0, self.image_progress_canvas.winfo_width())
+        height = max(1, self.image_progress_canvas.winfo_height())
+        self.image_progress_canvas.coords(self.image_progress_fill, 0, 0, width * self.image_progress_value, height)
 
     def confirm_sheet_issue(self, issue: SheetIssue) -> bool:
         if issue.issue_type != "without_code":
@@ -218,6 +430,7 @@ class ConverterApp:
 
         Button(buttons, text="Оставить выбранную", width=20, command=choose).pack(side="right")
         dialog.protocol("WM_DELETE_WINDOW", choose)
+        self._center_window(dialog)
         self.root.wait_window(dialog)
         return products[int(selected.get())]
 
@@ -270,6 +483,22 @@ class ConverterApp:
         canvas.pack(side="left", fill="both", expand=True, pady=(4, 10))
         scrollbar.pack(side="right", fill="y", pady=(4, 10))
 
+        def scroll_table(event) -> str:
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                delta = int(getattr(event, "delta", 0) or 0)
+                if delta:
+                    canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            return "break"
+
+        for widget in (dialog, container, canvas, table):
+            widget.bind("<MouseWheel>", scroll_table)
+            widget.bind("<Button-4>", scroll_table)
+            widget.bind("<Button-5>", scroll_table)
+
         for row_index, product in enumerate(products):
             code_var = StringVar(value=product.code or "")
             price_var = StringVar(value="" if money(product.retail_price) in (None, 0) else str(product.retail_price))
@@ -305,7 +534,7 @@ class ConverterApp:
                     messagebox.showerror(APP_TITLE, f"Цена должна быть больше 0:\n\n{product.name}", parent=dialog)
                     return
                 fixed_price = int(number) if number.is_integer() else number
-                edited.append(replace(product, code=code, retail_price=fixed_price, wholesale_price=fixed_price))
+                edited.append(replace(product, code=code, retail_price=fixed_price))
             result["products"] = edited
             dialog.destroy()
 
@@ -316,6 +545,7 @@ class ConverterApp:
         Button(buttons, text="Включить исправленные", width=24, command=save).pack(side="right")
         Button(buttons, text="Пропустить все", width=16, command=skip_all).pack(side="right", padx=(0, 8))
         dialog.protocol("WM_DELETE_WINDOW", skip_all)
+        self._center_window(dialog)
         self.root.wait_window(dialog)
         return result["products"]
 
@@ -355,12 +585,38 @@ class ConverterApp:
         canvas.pack(side="left", fill="both", expand=True, pady=(4, 10))
         scrollbar.pack(side="right", fill="y", pady=(4, 10))
 
+        def scroll_table(event) -> str:
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                delta = int(getattr(event, "delta", 0) or 0)
+                if delta:
+                    canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            return "break"
+
+        for widget in (dialog, container, canvas, table):
+            widget.bind("<MouseWheel>", scroll_table)
+            widget.bind("<Button-4>", scroll_table)
+            widget.bind("<Button-5>", scroll_table)
+
         for row_index, group in enumerate(groups):
             name_var = StringVar(value=group.group_name)
             id_var = StringVar(value=group.group_id)
             Label(table, text=group.source_sheet, width=28, anchor="w").grid(row=row_index, column=0, sticky="ew", padx=(6, 8), pady=3)
-            Entry(table, textvariable=name_var, width=42).grid(row=row_index, column=1, sticky="ew", padx=(0, 8), pady=3)
-            Entry(table, textvariable=id_var, width=20).grid(row=row_index, column=2, sticky="ew", padx=(0, 6), pady=3)
+            name_entry = Entry(table, textvariable=name_var, width=42)
+            id_entry = Entry(table, textvariable=id_var, width=20)
+            self._bind_entry_shortcuts(name_entry)
+            self._bind_entry_shortcuts(id_entry)
+            name_entry.bind("<MouseWheel>", scroll_table)
+            name_entry.bind("<Button-4>", scroll_table)
+            name_entry.bind("<Button-5>", scroll_table)
+            id_entry.bind("<MouseWheel>", scroll_table)
+            id_entry.bind("<Button-4>", scroll_table)
+            id_entry.bind("<Button-5>", scroll_table)
+            name_entry.grid(row=row_index, column=1, sticky="ew", padx=(0, 8), pady=3)
+            id_entry.grid(row=row_index, column=2, sticky="ew", padx=(0, 6), pady=3)
             rows.append((group, name_var, id_var))
 
         buttons = Frame(container)
@@ -385,6 +641,7 @@ class ConverterApp:
         Button(buttons, text="Продолжить", width=18, command=save).pack(side="right")
         Button(buttons, text="Отмена", width=14, command=cancel).pack(side="right", padx=(0, 8))
         dialog.protocol("WM_DELETE_WINDOW", cancel)
+        self._center_window(dialog)
         self.root.wait_window(dialog)
         return result["groups"]
 
@@ -424,6 +681,7 @@ class ConverterApp:
         Button(buttons, text="Нет, пропустить", width=16, command=lambda: choose(False)).pack(side="left")
 
         dialog.protocol("WM_DELETE_WINDOW", lambda: choose(False))
+        self._center_window(dialog)
         self.root.wait_window(dialog)
         return result["include"], apply_to_all.get()
 

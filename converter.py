@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,15 +28,22 @@ DEFAULT_GROUP_CACHE_FILE = "group_cache.json"
 class SourceProduct:
     code: str | None
     name: str
+    name_says_unavailable: bool
     unit: str | None
     stock: Any
     retail_price: Any
     wholesale_price: Any
-    dealer_price: Any
+    sko_price: Any
     comment: str | None
     quantity: Any
     source_sheet: str
     row_number: int
+
+
+@dataclass
+class ExportedProduct:
+    product: SourceProduct
+    output_row: int
 
 
 @dataclass
@@ -47,6 +56,32 @@ class ConversionStats:
     skipped_without_group_id: dict[str, int]
     exported_images_count: int
     images_output_dir: str | None
+
+
+@dataclass
+class WorksheetImage:
+    image: Any
+    image_bytes: bytes
+    start_row: int
+    end_row: int
+    start_col: int | None
+    end_col: int | None
+
+
+@dataclass
+class ImageExportCandidate:
+    output_row: int
+    code: str
+    image_bytes: bytes
+    extension: str
+
+
+@dataclass
+class ImageWriteTask:
+    output_row: int
+    image_bytes: bytes
+    target_path: Path
+    relative_path: str
 
 
 @dataclass
@@ -65,7 +100,7 @@ class SheetColumns:
     stock: int | None
     retail_price: int
     wholesale_price: int | None
-    dealer_price: int | None
+    sko_price: int | None
     comment: int | None
     quantity: int | None
 
@@ -80,6 +115,14 @@ class SheetIssue:
 IssueHandler = Callable[[SheetIssue], bool]
 DuplicateChoiceHandler = Callable[[str, list[SourceProduct]], SourceProduct]
 ProductIssueHandler = Callable[[list[SourceProduct]], list[SourceProduct]]
+ProgressCallback = Callable[[int, int], None]
+
+
+EMU_PER_PIXEL = 9525
+IMAGE_WORKER_COUNT = 4
+UNAVAILABLE_NAME_PATTERN = re.compile(
+    r"(?i)(?:\s*[\(\[\{,;:–—-]\s*)?\bнет\s+в\s+наличии\b(?:\s*[\)\]\},;:–—-]\s*)?"
+)
 
 
 def normalize_text(value: Any) -> str:
@@ -90,6 +133,13 @@ def normalize_text(value: Any) -> str:
 
 def normalize_key(value: Any) -> str:
     return normalize_text(value).casefold()
+
+
+def name_without_availability_marker(value: Any) -> tuple[str, bool]:
+    text = normalize_text(value)
+    cleaned, replacements = UNAVAILABLE_NAME_PATTERN.subn(" ", text)
+    cleaned = normalize_text(re.sub(r"\s+([,.;:])", r"\1", cleaned))
+    return cleaned, replacements > 0
 
 
 def compact_key(value: Any) -> str:
@@ -292,13 +342,120 @@ def image_extension(image: Any) -> str:
     return ".png"
 
 
-def image_anchor_row(image: Any) -> int | None:
-    anchor = getattr(image, "anchor", None)
-    marker = getattr(anchor, "_from", None)
+def marker_row(marker: Any) -> int | None:
     row = getattr(marker, "row", None)
     if row is None:
         return None
     return int(row) + 1
+
+
+def marker_end_row(marker: Any) -> int | None:
+    row = getattr(marker, "row", None)
+    if row is None:
+        return None
+    row_offset = getattr(marker, "rowOff", 0) or 0
+    return int(row) + (1 if row_offset else 0)
+
+
+def marker_col(marker: Any) -> int | None:
+    col = getattr(marker, "col", None)
+    if col is None:
+        return None
+    return int(col) + 1
+
+
+def marker_end_col(marker: Any) -> int | None:
+    col = getattr(marker, "col", None)
+    if col is None:
+        return None
+    col_offset = getattr(marker, "colOff", 0) or 0
+    return int(col) + (1 if col_offset else 0)
+
+
+def row_height_pixels(ws: Worksheet, row_number: int) -> float:
+    height = ws.row_dimensions[row_number].height or ws.sheet_format.defaultRowHeight or 15
+    return float(height) * 96 / 72
+
+
+def emu_to_pixels(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value) / EMU_PER_PIXEL
+
+
+def image_display_height_pixels(image: Any) -> float | None:
+    anchor = getattr(image, "anchor", None)
+    ext = getattr(anchor, "ext", None)
+    height = emu_to_pixels(getattr(ext, "cy", None))
+    if height:
+        return height
+    fallback = getattr(image, "height", None)
+    return float(fallback) if fallback else None
+
+
+def image_display_width_pixels(image: Any) -> float | None:
+    anchor = getattr(image, "anchor", None)
+    ext = getattr(anchor, "ext", None)
+    width = emu_to_pixels(getattr(ext, "cx", None))
+    if width:
+        return width
+    fallback = getattr(image, "width", None)
+    return float(fallback) if fallback else None
+
+
+def column_width_pixels(ws: Worksheet, column_number: int) -> float:
+    from openpyxl.utils import get_column_letter
+
+    width = ws.column_dimensions[get_column_letter(column_number)].width or 8.43
+    return float(width) * 7 + 5
+
+
+def estimated_end_row(ws: Worksheet, start_row: int, image: Any) -> int:
+    height = image_display_height_pixels(image)
+    if not height:
+        return start_row
+
+    remaining = float(height)
+    row_number = start_row
+    while remaining > row_height_pixels(ws, row_number) and row_number < ws.max_row:
+        remaining -= row_height_pixels(ws, row_number)
+        row_number += 1
+    return row_number
+
+
+def estimated_end_col(ws: Worksheet, start_col: int, image: Any) -> int:
+    width = image_display_width_pixels(image)
+    if not width:
+        return start_col
+
+    remaining = float(width)
+    col_number = start_col
+    max_col = max(ws.max_column, start_col)
+    while remaining > column_width_pixels(ws, col_number) and col_number < max_col:
+        remaining -= column_width_pixels(ws, col_number)
+        col_number += 1
+    return col_number
+
+
+def product_row_range(ws: Worksheet, row_number: int, columns: SheetColumns | None) -> tuple[int, int]:
+    if columns is None:
+        return row_number, row_number
+
+    relevant_columns = [
+        column + 1
+        for column in (columns.code, columns.name, columns.retail_price)
+        if column is not None
+    ]
+    start_row = row_number
+    end_row = row_number
+    for merged_range in ws.merged_cells.ranges:
+        if not (merged_range.min_row <= row_number <= merged_range.max_row):
+            continue
+        if not any(merged_range.min_col <= column <= merged_range.max_col for column in relevant_columns):
+            continue
+        start_row = min(start_row, merged_range.min_row)
+        end_row = max(end_row, merged_range.max_row)
+    return start_row, end_row
 
 
 def is_decorative_new_badge(image_bytes: bytes) -> bool:
@@ -365,7 +522,9 @@ def quantity(value: Any) -> int | float | None:
     return money(value)
 
 
-def availability(stock: Any, qty: Any) -> str:
+def availability(stock: Any, qty: Any, force_unavailable: bool = False) -> str:
+    if force_unavailable:
+        return "-"
     stock_text = normalize_key(stock)
     numeric_qty = quantity(qty)
     if numeric_qty and numeric_qty > 0:
@@ -394,8 +553,10 @@ def detect_columns(row: tuple[Any, ...], row_index: int) -> SheetColumns | None:
 
     unit = first_matching_header(headers, ("едизм", "единицаизмерения", "изм"))
     stock = first_matching_header(headers, ("остаток", "наличие", "склад"))
-    wholesale = first_matching_header(headers, ("постоянныхклиентов", "оптоваяцена", "опт"))
-    dealer = first_matching_header(headers, ("более350000", "дилер", "dealer"))
+    if retail is None:
+        return None
+    wholesale = next_non_empty_column(row, retail, 1)
+    sko = next_non_empty_column(row, retail, 2)
     comment = first_matching_header(headers, ("ссылкахкомментарий", "ссылкакомментарий", "допкомментарий", "комментарий"))
     quantity_col = first_matching_header(headers, ("количество", "колво", "остатокчисло"))
 
@@ -420,7 +581,7 @@ def detect_columns(row: tuple[Any, ...], row_index: int) -> SheetColumns | None:
         stock=stock,
         retail_price=retail,
         wholesale_price=wholesale,
-        dealer_price=dealer,
+        sko_price=sko,
         comment=comment,
         quantity=quantity_col,
     )
@@ -445,19 +606,40 @@ def cell_value(row: tuple[Any, ...], index: int | None) -> Any:
     return row[index]
 
 
+def next_non_empty_column(row: tuple[Any, ...], start_index: int | None, steps_ahead: int) -> int | None:
+    if start_index is None:
+        return None
+    found = 0
+    for index in range(start_index + 1, len(row)):
+        if normalize_text(row[index]):
+            found += 1
+            if found == steps_ahead:
+                return index
+    return None
+
+
+def optional_price(value: Any) -> int | float | None:
+    price = money(value)
+    if price is None or price <= 0:
+        return None
+    return price
+
+
 def default_issue_handler(issue: SheetIssue) -> bool:
     return issue.issue_type != "without_code"
 
 
 def product_from_row(row: tuple[Any, ...], columns: SheetColumns, source_sheet: str, row_number: int) -> SourceProduct:
+    name, name_says_unavailable = name_without_availability_marker(cell_value(row, columns.name))
     return SourceProduct(
         code=normalize_text(cell_value(row, columns.code)) or None,
-        name=normalize_text(cell_value(row, columns.name)),
+        name=name,
+        name_says_unavailable=name_says_unavailable,
         unit=normalize_unit(cell_value(row, columns.unit)),
         stock=cell_value(row, columns.stock),
         retail_price=cell_value(row, columns.retail_price),
         wholesale_price=cell_value(row, columns.wholesale_price),
-        dealer_price=cell_value(row, columns.dealer_price),
+        sko_price=cell_value(row, columns.sko_price),
         comment=normalize_text(cell_value(row, columns.comment)) or None,
         quantity=cell_value(row, columns.quantity),
         source_sheet=source_sheet,
@@ -489,7 +671,7 @@ def read_source_products(
             continue
 
         for row_number, row in enumerate(ws.iter_rows(min_row=columns.header_row + 1, max_row=ws.max_row, values_only=True), start=columns.header_row + 1):
-            name = normalize_text(cell_value(row, columns.name))
+            name, _ = name_without_availability_marker(cell_value(row, columns.name))
 
             if not name:
                 continue
@@ -714,7 +896,8 @@ def product_to_target_row(
     group_id, group_name = group_for_sheet(product.source_sheet, groups, aliases, group_configs)
     qty = quantity(product.quantity)
     retail = money(product.retail_price)
-    wholesale = money(product.wholesale_price) or retail
+    wholesale = optional_price(product.wholesale_price)
+    sko = optional_price(product.sko_price)
 
     row: list[Any] = [None] * max_columns
     write_value(row, indexes, "Код_товара", product.code)
@@ -726,8 +909,9 @@ def product_to_target_row(
     write_value(row, indexes, "Валюта", "KZT")
     write_value(row, indexes, "Единица_измерения", normalize_output_unit(product.unit))
     write_value(row, indexes, "Оптовая_цена", wholesale)
+    write_value(row, indexes, "\u0421\u041a\u041e_\u0446\u0435\u043d\u0430", sko)
     write_value(row, indexes, "Минимальный_заказ_опт", retail)
-    write_value(row, indexes, "Наличие", availability(product.stock, qty))
+    write_value(row, indexes, "Наличие", availability(product.stock, qty, product.name_says_unavailable))
     write_value(row, indexes, "Количество", qty)
     write_value(row, indexes, "Номер_группы", group_id)
     write_value(row, indexes, "Название_группы", group_name)
@@ -815,52 +999,238 @@ def images_output_dir_for(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}_images")
 
 
-def export_product_images(source_path: Path, output_path: Path, products: list[SourceProduct]) -> tuple[int, Path | None]:
-    products_by_position: dict[tuple[str, int], list[SourceProduct]] = {}
-    for product in products:
-        if not product.code:
-            continue
-        products_by_position.setdefault((normalize_key(product.source_sheet), product.row_number), []).append(product)
+class ExcelImageExtractor:
+    def __init__(self, ws: Worksheet):
+        self.ws = ws
 
-    if not products_by_position:
-        return 0, None
+    def collect(self) -> list[WorksheetImage]:
+        collected: list[WorksheetImage] = []
+        for image in list(getattr(self.ws, "_images", [])):
+            worksheet_image = self._worksheet_image(image)
+            if worksheet_image is not None:
+                collected.append(worksheet_image)
+        return collected
 
-    workbook = load_workbook(source_path, read_only=False, data_only=True)
-    output_dir = images_output_dir_for(output_path)
-    written = 0
-    filename_counts: dict[str, int] = {}
-    output_dir_prepared = False
+    def _worksheet_image(self, image: Any) -> WorksheetImage | None:
+        anchor = getattr(image, "anchor", None)
+        start_marker = getattr(anchor, "_from", None)
+        start_row = marker_row(start_marker)
+        if start_row is None:
+            return None
 
-    for ws in workbook.worksheets:
-        images = list(getattr(ws, "_images", []))
-        if not images:
-            continue
-        for image in images:
-            row_number = image_anchor_row(image)
-            if row_number is None:
-                continue
-            matches = products_by_position.get((normalize_key(ws.title), row_number))
-            if not matches:
-                continue
-            product = matches[0]
+        start_col = marker_col(start_marker)
+        end_marker = getattr(anchor, "_to", None)
+        end_row = marker_end_row(end_marker) if end_marker is not None else None
+        end_col = marker_end_col(end_marker) if end_marker is not None else None
+
+        if end_row is None:
+            end_row = estimated_end_row(self.ws, start_row, image)
+        if start_col is not None and end_col is None:
+            end_col = estimated_end_col(self.ws, start_col, image)
+
+        try:
             image_bytes = image._data()
-            if is_decorative_new_badge(image_bytes):
-                continue
-            base_name = safe_filename_part(product.code)
-            filename_counts[base_name] = filename_counts.get(base_name, 0) + 1
-            suffix = "" if filename_counts[base_name] == 1 else f"_{filename_counts[base_name]}"
-            if not output_dir_prepared:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                for existing in output_dir.iterdir():
-                    if existing.is_file():
-                        existing.unlink()
-                output_dir_prepared = True
-            target = output_dir / f"{base_name}{suffix}{image_extension(image)}"
-            target.write_bytes(image_bytes)
-            written += 1
+        except Exception:
+            return None
 
-    workbook.close()
-    return written, output_dir if written else None
+        return WorksheetImage(
+            image=image,
+            image_bytes=image_bytes,
+            start_row=start_row,
+            end_row=max(start_row, end_row),
+            start_col=start_col,
+            end_col=end_col,
+        )
+
+
+class ProductImageMatcher:
+    def __init__(self, images: list[WorksheetImage], columns: SheetColumns | None):
+        self.images = images
+        self.min_col, self.max_col = self._source_table_bounds(columns)
+
+    def images_for_range(self, start_row: int, end_row: int) -> list[WorksheetImage]:
+        return [
+            image
+            for image in self.images
+            if image.start_row <= end_row and image.end_row >= start_row and self._inside_source_table(image)
+        ]
+
+    def _source_table_bounds(self, columns: SheetColumns | None) -> tuple[int | None, int | None]:
+        if columns is None:
+            return None, None
+        detected_columns = [
+            value
+            for value in (
+                columns.code,
+                columns.name,
+                columns.unit,
+                columns.stock,
+                columns.retail_price,
+                columns.wholesale_price,
+                columns.sko_price,
+                columns.comment,
+                columns.quantity,
+            )
+            if value is not None
+        ]
+        if not detected_columns:
+            return None, None
+        return 1, max(detected_columns) + 4
+
+    def _inside_source_table(self, image: WorksheetImage) -> bool:
+        if self.min_col is None or self.max_col is None:
+            return True
+        if image.start_col is None or image.end_col is None:
+            return True
+        return image.start_col <= self.max_col and image.end_col >= self.min_col
+
+
+def prepare_images_output_dir(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for existing in output_dir.iterdir():
+        if existing.is_file():
+            existing.unlink()
+
+
+def analyze_sheet_image_exports(
+    source_path: Path,
+    sheet_name: str,
+    sheet_products: list[ExportedProduct],
+) -> list[ImageExportCandidate]:
+    workbook = load_workbook(source_path, read_only=False, data_only=True)
+    try:
+        ws = workbook[sheet_name]
+        images = ExcelImageExtractor(ws).collect()
+        if not images:
+            return []
+
+        columns = find_sheet_columns(ws)
+        matcher = ProductImageMatcher(images, columns)
+        candidates: list[ImageExportCandidate] = []
+        for exported in sheet_products:
+            if not exported.product.code:
+                continue
+            start_row, end_row = product_row_range(ws, exported.product.row_number, columns)
+            for worksheet_image in matcher.images_for_range(start_row, end_row):
+                if is_decorative_new_badge(worksheet_image.image_bytes):
+                    continue
+                candidates.append(
+                    ImageExportCandidate(
+                        output_row=exported.output_row,
+                        code=exported.product.code,
+                        image_bytes=worksheet_image.image_bytes,
+                        extension=image_extension(worksheet_image.image),
+                    )
+                )
+        return candidates
+    finally:
+        workbook.close()
+
+
+def prepare_image_write_tasks(
+    output_path: Path,
+    candidates: list[ImageExportCandidate],
+    allow_multiple_images_per_product: bool = False,
+) -> list[ImageWriteTask]:
+    output_dir = images_output_dir_for(output_path)
+    filename_counts: dict[str, int] = {}
+    selected_counts_by_code: dict[str, int] = {}
+    image_hashes_by_code: dict[str, set[str]] = {}
+    tasks: list[ImageWriteTask] = []
+
+    for candidate in sorted(candidates, key=lambda item: item.output_row):
+        code_key = normalize_text(candidate.code)
+        image_hash = hashlib.sha256(candidate.image_bytes).hexdigest()
+        seen_hashes = image_hashes_by_code.setdefault(code_key, set())
+        if image_hash in seen_hashes:
+            continue
+        if not allow_multiple_images_per_product and selected_counts_by_code.get(code_key, 0) >= 1:
+            continue
+        seen_hashes.add(image_hash)
+        selected_counts_by_code[code_key] = selected_counts_by_code.get(code_key, 0) + 1
+
+        base_name = safe_filename_part(candidate.code)
+        filename_counts[base_name] = filename_counts.get(base_name, 0) + 1
+        suffix = "" if filename_counts[base_name] == 1 else f"_{filename_counts[base_name]}"
+        filename = f"{base_name}{suffix}{candidate.extension}"
+        tasks.append(
+            ImageWriteTask(
+                output_row=candidate.output_row,
+                image_bytes=candidate.image_bytes,
+                target_path=output_dir / filename,
+                relative_path=f"{output_dir.name}/{filename}",
+            )
+        )
+
+    return tasks
+
+
+def write_image_task(task: ImageWriteTask) -> tuple[int, str]:
+    task.target_path.write_bytes(task.image_bytes)
+    return task.output_row, task.relative_path
+
+
+def export_product_images(
+    source_path: Path,
+    output_path: Path,
+    exported_products: list[ExportedProduct],
+    progress_callback: ProgressCallback | None = None,
+    allow_multiple_images_per_product: bool = False,
+) -> tuple[int, Path | None, dict[int, str]]:
+    products_by_sheet: dict[str, list[ExportedProduct]] = {}
+    for exported in exported_products:
+        if not exported.product.code:
+            continue
+        products_by_sheet.setdefault(normalize_key(exported.product.source_sheet), []).append(exported)
+
+    if not products_by_sheet:
+        if progress_callback:
+            progress_callback(0, 0)
+        return 0, None, {}
+
+    image_candidates: list[ImageExportCandidate] = []
+    max_workers = min(IMAGE_WORKER_COUNT, len(products_by_sheet))
+    total_sheets = len(products_by_sheet)
+    if progress_callback:
+        progress_callback(0, -total_sheets)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(analyze_sheet_image_exports, source_path, sheet_products[0].product.source_sheet, sheet_products)
+            for sheet_products in products_by_sheet.values()
+        ]
+        for processed_count, future in enumerate(as_completed(futures), start=1):
+            image_candidates.extend(future.result())
+            if progress_callback:
+                progress_callback(processed_count, -total_sheets)
+
+    image_tasks = prepare_image_write_tasks(output_path, image_candidates, allow_multiple_images_per_product)
+    total_images = len(image_tasks)
+    if progress_callback:
+        progress_callback(0, total_images)
+    if not image_tasks:
+        return 0, None, {}
+
+    output_dir = images_output_dir_for(output_path)
+    prepare_images_output_dir(output_dir)
+
+    written = 0
+    image_paths_by_output_row: dict[int, str] = {}
+    write_results: dict[int, tuple[int, str]] = {}
+    with ThreadPoolExecutor(max_workers=min(IMAGE_WORKER_COUNT, len(image_tasks))) as executor:
+        futures = {executor.submit(write_image_task, task): index for index, task in enumerate(image_tasks)}
+        for processed_count, future in enumerate(as_completed(futures), start=1):
+            task_index = futures[future]
+            output_row, image_path = future.result()
+            write_results[task_index] = (output_row, image_path)
+            written += 1
+            if progress_callback:
+                progress_callback(processed_count, total_images)
+
+    for task_index in sorted(write_results):
+        output_row, image_path = write_results[task_index]
+        image_paths_by_output_row.setdefault(output_row, image_path)
+
+    return written, output_dir if written else None, image_paths_by_output_row
 
 
 def convert(
@@ -873,9 +1243,15 @@ def convert(
     group_cache_path: Path | None = None,
     duplicate_handler: DuplicateChoiceHandler | None = None,
     product_issue_handler: ProductIssueHandler | None = None,
+    progress_callback: ProgressCallback | None = None,
+    image_progress_callback: ProgressCallback | None = None,
+    allow_multiple_images_per_product: bool = False,
 ) -> ConversionStats:
     products, skipped_without_code, skipped_without_price, skipped_invalid_code = read_source_products(source_path, issue_handler, product_issue_handler)
     products = deduplicate_products(products, duplicate_handler)
+    total_products = len(products)
+    if progress_callback:
+        progress_callback(0, total_products)
     schema = read_schema(schema_path or default_schema_path())
     groups = groups_from_schema(schema)
     aliases = load_aliases(aliases_path)
@@ -887,24 +1263,38 @@ def convert(
     append_configured_groups(workbook, group_configs or [])
     max_columns = len(schema["product_headers"])
     converted_count = 0
-    exported_products: list[SourceProduct] = []
+    exported_products: list[ExportedProduct] = []
 
-    for product in products:
+    for processed_count, product in enumerate(products, start=1):
         target_row = product_to_target_row(product, max_columns, indexes, groups, aliases, config_by_sheet)
         group_id = target_row[indexes["Номер_группы"] - 1]
         group_name = target_row[indexes["Название_группы"] - 1]
         if not group_id:
             missing_group_ids[str(group_name)] = missing_group_ids.get(str(group_name), 0) + 1
             skipped_without_group_id[str(group_name)] = skipped_without_group_id.get(str(group_name), 0) + 1
+            if progress_callback:
+                progress_callback(processed_count, total_products)
             continue
         ws.append(target_row)
         converted_count += 1
-        exported_products.append(product)
+        exported_products.append(ExportedProduct(product=product, output_row=ws.max_row))
+        if progress_callback:
+            progress_callback(processed_count, total_products)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    exported_images_count, images_output_dir, image_paths_by_output_row = export_product_images(
+        source_path,
+        output_path,
+        exported_products,
+        image_progress_callback,
+        allow_multiple_images_per_product,
+    )
+    image_column = indexes.get("Ссылка_изображения")
+    if image_column is not None:
+        for output_row, image_path in image_paths_by_output_row.items():
+            ws.cell(row=output_row, column=image_column, value=image_path)
     workbook.save(output_path)
     workbook.close()
-    exported_images_count, images_output_dir = export_product_images(source_path, output_path, exported_products)
     if group_configs is not None:
         save_group_cache(group_configs, group_cache_path)
     return ConversionStats(
@@ -942,6 +1332,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include source rows that have a product name and price but no code.",
     )
+    parser.add_argument(
+        "--allow-multiple-images-per-product",
+        action="store_true",
+        help="Export several different images for one product code using _2, _3 suffixes.",
+    )
     return parser
 
 
@@ -950,7 +1345,14 @@ def main() -> None:
     aliases = args.aliases or default_aliases_path()
     handler = (lambda issue: True) if args.include_without_code else None
     try:
-        stats = convert(args.source, args.output, aliases, args.schema, handler)
+        stats = convert(
+            args.source,
+            args.output,
+            aliases,
+            args.schema,
+            handler,
+            allow_multiple_images_per_product=args.allow_multiple_images_per_product,
+        )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
