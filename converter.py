@@ -1044,16 +1044,55 @@ class ExcelImageExtractor:
 
 
 class ProductImageMatcher:
+    MAX_NEARBY_ROW_GAP = 1
+
     def __init__(self, images: list[WorksheetImage], columns: SheetColumns | None):
         self.images = images
         self.min_col, self.max_col = self._source_table_bounds(columns)
 
     def images_for_range(self, start_row: int, end_row: int) -> list[WorksheetImage]:
-        return [
-            image
-            for image in self.images
-            if image.start_row <= end_row and image.end_row >= start_row and self._inside_source_table(image)
-        ]
+        ranked_matches: list[tuple[tuple[int, int, int, int], WorksheetImage]] = []
+        for image in self.images:
+            if not self._inside_source_table(image):
+                continue
+            score = self._match_score(image, start_row, end_row)
+            if score is None:
+                continue
+            ranked_matches.append((score, image))
+
+        ranked_matches.sort(key=lambda item: item[0])
+        return [image for _score, image in ranked_matches]
+
+    def _match_score(
+        self,
+        image: WorksheetImage,
+        start_row: int,
+        end_row: int,
+    ) -> tuple[int, int, int, int] | None:
+        if image.end_row < start_row:
+            gap = start_row - image.end_row
+        elif image.start_row > end_row:
+            gap = image.start_row - end_row
+        else:
+            gap = 0
+
+        if gap > self.MAX_NEARBY_ROW_GAP:
+            return None
+
+        target_center_twice = start_row + end_row
+        image_center_twice = image.start_row + image.end_row
+        center_distance_twice = min(
+            abs(image_center_twice - (start_row * 2)),
+            abs(image_center_twice - (end_row * 2)),
+            abs(image_center_twice - target_center_twice),
+        )
+        span = max(0, image.end_row - image.start_row)
+        position_bias = 0
+        if image.start_row > end_row:
+            position_bias = 2
+        elif image.end_row < start_row:
+            position_bias = 1
+        return (center_distance_twice, span, position_bias, gap)
 
     def _source_table_bounds(self, columns: SheetColumns | None) -> tuple[int | None, int | None]:
         if columns is None:
